@@ -10,7 +10,11 @@
 #define WRAP_CLOSE_FD(fd) do{ \
     if( (fd) != -1 ){ close(fd); (fd) = -1; } }while(0)
 
-#define SSLAPI_TRACE_OUTPUT(fmt,arg...) printf(fmt,##arg)
+#define POLLIN_FLAG                (POLLIN|POLLHUP|POLLERR)
+#define SET_POLLIN_FLAG(pollfds,fileid)    { (pollfds).fd	= fileid; (pollfds).events = POLLIN_FLAG; }
+#define IS_POLLIN_OK(revent)  (((revent) & POLLIN) && (!((revent) & (POLLERR|POLLHUP|POLLNVAL))) )
+
+#define SSLAPI_TRACE_OUTPUT(fmt,arg...) printf( "[%s:%d] "fmt,__func__,__LINE__,##arg)
 
 #define SSLAPI_ERRORCODE_SUCC       0
 #define SSLAPI_ERRORCODE_INIT       1
@@ -28,9 +32,20 @@ static inline void SSLAPI_InitSocket(struct SSLSocket* sslsock){
     sslsock->ssl            = NULL;
 }
 
+struct ProxyItem;
+typedef int (*PROXYITEM_RECV)(struct ProxyItem* item,char* buf, size_t size);
+typedef int (*PROXYITEM_SEND)(struct ProxyItem* item,const char* buf, size_t size);
+struct ProxyItem{
+    int             sd;
+    PROXYITEM_RECV  recvfunc;
+    PROXYITEM_SEND  sendfunc;
+    void*           priv;
+};
+
 int SocketAPI_TCPGetLocalPort(int sd);
 int SocketAPI_TCPCreate(const char *serv,uint16_t port,int isbind,int connecttimeout_ms);
 int SocketAPI_TCPAccept(int ld,struct sockaddr_storage* dst);
+int SockAPI_Proxy(struct ProxyItem *item);
 
 int SSLAPI_InitSSLServer(const char*certpem,const char* keypem,int port, const char* localaddr);
 int SSLAPI_Accept(struct SSLSocket* sslsock,struct sockaddr_storage* dst);
@@ -38,10 +53,9 @@ int SSLAPI_Accept(struct SSLSocket* sslsock,struct sockaddr_storage* dst);
 int SSLAPI_InitSSLClient();
 int SSLAPI_Connect(struct SSLSocket* sslsock, const char* svraddr,int port);
 
-int SSLAPI_Read(struct SSLSocket* sslsock,char* buf,int len);
-int SSLAPI_Write(struct SSLSocket* sslsock,const char* data,int len,int writeall);
+int SSLAPI_Read(struct SSLSocket* sslsock,char* buf,size_t len);
+int SSLAPI_Write(struct SSLSocket* sslsock,const char* data,size_t len,int writeall);
 void SSLAPI_Close(struct SSLSocket* sslsock);
 void SSLAPI_Release();
 
 #endif
-

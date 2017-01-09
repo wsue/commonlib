@@ -12,6 +12,7 @@
 #include <netinet/tcp.h>
 #include <sys/ioctl.h>
 #include <poll.h>
+#include <pthread.h>
 //#include <linux/tcp.h>
 
 #include <openssl/rsa.h>
@@ -233,6 +234,69 @@ int SocketAPI_TCPCreate(const char *serv,uint16_t port,int isbind,int connecttim
     return -1;
 }
 
+static int sendall(struct ProxyItem *item,const char* buf,int size)
+{
+    int ret = 0;
+    while( size > 0 ){
+        ret = item->sendfunc(item,buf,size);
+        if( ret <= 0 ){
+            ret = -1;
+            break;
+        }
+
+        buf += ret;
+        size -= ret;
+    }
+
+    return ret;
+}
+
+int SockAPI_Proxy(struct ProxyItem item[2])
+{
+    int ret = -1;
+    while(1){
+        int i   = 0;
+        ret = -1;
+        struct pollfd pfds[2]	 = {
+            {item[0].sd,POLLIN_FLAG,0},
+            {item[1].sd,POLLIN_FLAG,0}
+        };
+        WRAP_SYSAPI( ret , poll(pfds,2,-1));
+
+        if( ret < 1 ){
+            SSLAPI_TRACE_OUTPUT("poll fail %d/%d\n",ret,errno);
+            break;
+        }
+
+        for( i = 0; i < 2 && ret > 0 ; i ++ ){
+            if( !pfds[i].revents )
+                continue;
+
+            ret --;
+            if( !IS_POLLIN_OK(pfds[i].revents ) ){
+                ret = -1;
+                break;
+            }
+            else{
+                struct ProxyItem* input = i ==0 ? &item[0] : &item[1];
+                struct ProxyItem* output = i ==1 ? &item[0] : &item[1];
+                char    buf[8192];
+                int     size    = input->recvfunc(input,buf,sizeof(buf));
+
+                if( size < 1 || sendall(output,buf,size) < 0 ){
+                    ret = -1;
+                    break;
+                }
+            }
+        }
+
+        if( ret < 0 ){
+            break;
+        }
+    }
+
+    return ret;
+}
 
 static void ssl_init()
 { 
@@ -470,7 +534,7 @@ int SSLAPI_Accept(struct SSLSocket* sslsock,struct sockaddr_storage* dst)
     int sd  = SocketAPI_TCPAccept(sSSLCtrl.listensd_,dst);
     if( sd < 0 ){
         SSLAPI_TRACE_OUTPUT("accept fail\n");
-        return -1;
+        return -2;
     }
     else{
         SSL* ssl = ssl_servctx_accept(sd,sSSLCtrl.servctx_);
@@ -509,7 +573,7 @@ int SSLAPI_Connect(struct SSLSocket* sslsock, const char* svraddr,int port)
     return -1;
 }
 
-int SSLAPI_Read(struct SSLSocket* sslsock,char* buf,int len)
+int SSLAPI_Read(struct SSLSocket* sslsock,char* buf,size_t len)
 {
     if( !sslsock || !sslsock->ssl )
         return -1;
@@ -524,7 +588,7 @@ int SSLAPI_Read(struct SSLSocket* sslsock,char* buf,int len)
 }
 
 
-int SSLAPI_Write(struct SSLSocket* sslsock,const char* data,int len,int writeall)
+int SSLAPI_Write(struct SSLSocket* sslsock,const char* data,size_t len,int writeall)
 {
     if( !sslsock || !sslsock->ssl )
         return -1;
@@ -555,6 +619,11 @@ int SSLAPI_Write(struct SSLSocket* sslsock,const char* data,int len,int writeall
 }
     
 
+#define CERT_PEM        "cert.pem"
+#define KEY_PEM         "key.pem"
+#define SERVER_ADDR     "10.64.66.229"
+#define SERVER_PORT     443
+
 static void test_client(const char* svraddr,int port)
 {
     char    buf[4096]   = "";
@@ -580,9 +649,91 @@ static void test_client(const char* svraddr,int port)
     SSLAPI_Close(&sslsock);
 }
 
+int sslitem_recv(struct ProxyItem* item,char* buf, size_t size)
+{
+    struct SSLSocket*   sslsock = (struct SSLSocket *)item->priv;
+    return SSLAPI_Read(sslsock,buf,size);
+}
+
+int sslitem_send(struct ProxyItem* item,const char* buf, size_t size)
+{
+    struct SSLSocket*   sslsock = (struct SSLSocket *)item->priv;
+    return SSLAPI_Write(sslsock,buf,size,1);
+}
+
+static void* accept_connect(void *p)
+{
+    struct SSLSocket* svrsock   = (struct SSLSocket *)p;
+    struct SSLSocket   clientsock;
+    struct ProxyItem proxyitems[2]   = {
+        {svrsock->sd,sslitem_recv,sslitem_send,p},
+        {-1,sslitem_recv,sslitem_send,&clientsock}
+    };
+
+    SSLAPI_InitSocket(&clientsock);
+    if( SSLAPI_Connect(&clientsock, SERVER_ADDR, SERVER_PORT) != 0 ){
+        SSLAPI_TRACE_OUTPUT("connect client fail\n");
+    }
+    else{
+        proxyitems[1].sd = clientsock.sd;
+        SSLAPI_TRACE_OUTPUT("begin proxy %d->%d\n",proxyitems[0].sd,proxyitems[1].sd);
+        SockAPI_Proxy(proxyitems);
+        SSLAPI_TRACE_OUTPUT("end proxy %d->%d\n",proxyitems[0].sd,proxyitems[1].sd);
+    }
+
+    SSLAPI_Close(&clientsock);
+    SSLAPI_Close(svrsock);
+
+    free(p);
+    return NULL;
+}
+
+static int StartTask(pthread_t *thrid,void* (*start_routine)(void*),void *arg)
+{
+    pthread_t slave_tid;
+    int ret = pthread_create(thrid ? thrid : &slave_tid, NULL, start_routine, arg);
+    if( ret == 0 && !thrid )
+        pthread_detach(slave_tid);
+    return ret == 0;
+}
+
+static void start_accept(struct SSLSocket* svrsock)
+{
+    struct SSLSocket* sock  = (struct SSLSocket *)malloc(sizeof(struct SSLSocket));
+    memcpy(sock,svrsock,sizeof(*sock));
+    StartTask(NULL,accept_connect,sock);
+}
+
+
+static void test_server(int port, const char* localaddr)
+{
+    if( SSLAPI_InitSSLClient() ){
+        SSLAPI_TRACE_OUTPUT("init client fail\n");
+        return ;
+    }
+
+    if( SSLAPI_InitSSLServer(CERT_PEM,KEY_PEM,port,localaddr) ){
+        SSLAPI_TRACE_OUTPUT("init server %d/%s %s:%s fail\n",port,localaddr,CERT_PEM,KEY_PEM);
+        return ;
+    }
+
+    while(1){
+        struct SSLSocket sslsock;
+        SSLAPI_InitSocket(&sslsock);
+
+        if( SSLAPI_Accept(&sslsock,NULL) != 0 ){
+            SSLAPI_TRACE_OUTPUT("accept server %d/%s %s:%s fail\n",port,localaddr,CERT_PEM,KEY_PEM);
+            break;
+        }
+
+        start_accept(&sslsock);
+    }
+}
+
 int main()
 {
-    test_client("10.64.66.229",443);
+    //test_client("10.64.66.229",443);
+    test_server(443,NULL);
     SSLAPI_Release();
     return 0;
 }

@@ -858,15 +858,20 @@ int SSLAPI_Write(struct SSLSocket* sslsock,const char* data,size_t len,int write
     }
 }
     
-#if 1
-#define CERT_PEM        "TmmsDefaultTempCert.p12"   
-#define KEY_PEM         NULL                        
-#else
-#define CERT_PEM        "cert.pem"
-#define KEY_PEM         "key.pem"
-#endif
-#define SERVER_ADDR     "10.64.66.229"
-#define SERVER_PORT     443
+
+
+
+
+
+
+struct SSLProxyInfo{
+    char    dstsvr[32];
+    int     dstport;
+};
+
+static struct SSLProxyInfo  sSSLProxyInfo;
+
+
 
 static void test_client(const char* svraddr,int port)
 {
@@ -899,7 +904,7 @@ static void test_client(const char* svraddr,int port)
 
 
 
-int sslitem_recv(struct ProxyItem* item,char* buf, size_t size)
+static int sslitem_recv(struct ProxyItem* item,char* buf, size_t size)
 {
     struct SSLSocket*   sslsock = (struct SSLSocket *)item->priv;
     int ret = SSLAPI_Read(sslsock,buf,size);
@@ -907,7 +912,7 @@ int sslitem_recv(struct ProxyItem* item,char* buf, size_t size)
     return ret;
 }
 
-int sslitem_send(struct ProxyItem* item,const char* buf, size_t size)
+static int sslitem_send(struct ProxyItem* item,const char* buf, size_t size)
 {
     struct SSLSocket*   sslsock = (struct SSLSocket *)item->priv;
     int ret= SSLAPI_Write(sslsock,buf,size,1);
@@ -920,12 +925,12 @@ static void* accept_connect(void *p)
     struct SSLSocket* svrsock   = (struct SSLSocket *)p;
     struct SSLSocket   clientsock;
     struct ProxyItem proxyitems[2]   = {
-        {svrsock->sd,sslitem_recv,sslitem_send,p, PROXYITEM_ECHOSTAT_SHOW},
+        {svrsock->sd,   sslitem_recv,sslitem_send,p, PROXYITEM_ECHOSTAT_SHOW},
         {-1,sslitem_recv,sslitem_send,&clientsock,PROXYITEM_ECHOSTAT_SHOW}
     };
 
     SSLAPI_InitSocket(&clientsock);
-    if( SSLAPI_Connect(&clientsock, SERVER_ADDR, SERVER_PORT) != 0 ){
+    if( SSLAPI_Connect(&clientsock, sSSLProxyInfo.dstsvr, sSSLProxyInfo.dstport) != 0 ){
         SSLAPI_TRACE_OUTPUT("connect client fail\n");
     }
     else{
@@ -949,24 +954,28 @@ static int StartTask(pthread_t *thrid,void* (*start_routine)(void*),void *arg)
     return ret == 0;
 }
 
-static void start_accept(struct SSLSocket* svrsock)
-{
-    struct SSLSocket* sock  = (struct SSLSocket *)malloc(sizeof(struct SSLSocket));
-    memcpy(sock,svrsock,sizeof(*sock));
-    StartTask(NULL,accept_connect,sock);
-}
 
-
-static void test_server(int port, const char* localaddr)
+int SSLAPI_Proxy(int localport, const char* localaddr,
+        const char* dstsvr, int dstport,
+        const char* certfile,const char* keyfile)
 {
-    if( SSLAPI_InitSSLClient() ){
-        SSLAPI_TRACE_OUTPUT("init client fail\n");
-        return ;
+    if( !dstsvr || !dstsvr[0] || dstport < 1 || dstport > 65535 ){
+        SSLAPI_TRACE_OUTPUT("wrong param\n");
+        return -1;
     }
 
-    if( SSLAPI_InitSSLServer(CERT_PEM,KEY_PEM,port,localaddr) ){
-        SSLAPI_TRACE_OUTPUT("init server %d/%s %s:%s fail\n",port,localaddr,CERT_PEM,KEY_PEM);
-        return ;
+    memset(&sSSLProxyInfo,0,sizeof(sSSLProxyInfo));
+    strncpy(sSSLProxyInfo.dstsvr,dstsvr,sizeof(sSSLProxyInfo.dstsvr)-1);
+    sSSLProxyInfo.dstport   = dstport;
+
+    if( SSLAPI_InitSSLClient() ){
+        SSLAPI_TRACE_OUTPUT("init client fail\n");
+        return -1;
+    }
+
+    if( SSLAPI_InitSSLServer(certfile,keyfile,localport,localaddr) ){
+        SSLAPI_TRACE_OUTPUT("init server %d/%s %s:%s fail\n",localport,localaddr,certfile,keyfile);
+        return -1;
     }
 
     while(1){
@@ -974,18 +983,34 @@ static void test_server(int port, const char* localaddr)
         SSLAPI_InitSocket(&sslsock);
 
         if( SSLAPI_Accept(&sslsock,NULL) != 0 ){
-            SSLAPI_TRACE_OUTPUT("accept server %d/%s %s:%s fail\n",port,localaddr,CERT_PEM,KEY_PEM);
+            SSLAPI_TRACE_OUTPUT("accept server %d/%s %s:%s fail\n",localport,localaddr,certfile,keyfile);
             break;
         }
-
-        start_accept(&sslsock);
+        else{
+            struct SSLSocket* sock  = (struct SSLSocket *)malloc(sizeof(struct SSLSocket));
+            memcpy(sock,&sslsock,sizeof(*sock));
+            StartTask(NULL,accept_connect,sock);
+        }
     }
+
+    return 0;
 }
 
-int main()
+
+int main(int argc, char** argv)
 {
+#if 0
+    if( argc < 3 ){
+        printf("%s [localaddr:]localport remoteaddr:remoteport p12certfile\n"
+                " or \n%s [localaddr:]localport remoteaddr:remoteport cert.pem key.pem\n",
+                argv[0],argv[0]);
+        return 1;
+    }
+#endif
+
     //test_client("10.64.66.229",443);
-    test_server(443,NULL);
+    SSLAPI_Proxy(443,NULL,"10.64.66.229",443,  "default.p12",   NULL);
+    //SSLAPI_Proxy(443,NULL,"10.64.66.229",443,  "cert.pem",   "key.pem");
     SSLAPI_Release();
     return 0;
 }

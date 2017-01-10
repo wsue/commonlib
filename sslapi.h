@@ -67,5 +67,9 @@ int SSLAPI_Write(struct SSLSocket* sslsock,const char* data,size_t len,int write
 void SSLAPI_Close(struct SSLSocket* sslsock);
 void SSLAPI_Release();
 
+int SSLAPI_Proxy(int localport, const char* localaddr,
+        const char* dstsvr, int dstport,
+        const char* certfile,const char* keyfile);
+
 #endif
 

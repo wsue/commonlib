@@ -254,14 +254,15 @@ static int sendall(struct ProxyItem *item,const char* buf,int size)
 }
 
 
-static void get_connect_name(int sd,char *name)
+static void get_connect_name(int sd,int isfrom,char *name)
 {
     struct sockaddr_in addr;
     socklen_t           len = sizeof(addr);
 
+    const char* colorcode = isfrom ? "\e[45m" : "\e[44m";
     memset(&addr,0,sizeof(addr));
     if( getpeername(sd, (struct sockaddr*) &addr, &len) == 0) {
-        sprintf(name,"%d/%s:%d",sd,inet_ntoa(addr.sin_addr),htons(addr.sin_port));
+        sprintf(name,"%s%d/%s:%d\e[0m",colorcode,sd,inet_ntoa(addr.sin_addr),htons(addr.sin_port));
     }
     else{
         name[0] = 0;
@@ -271,13 +272,14 @@ static void get_connect_name(int sd,char *name)
 int SockAPI_Proxy(struct ProxyItem item[2])
 {
     int ret = -1;
-    get_connect_name(item[0].sd,item[0].name);
-    get_connect_name(item[1].sd,item[1].name);
+    get_connect_name(item[0].sd,1,item[0].name);
+    get_connect_name(item[1].sd,0,item[1].name);
 
     SSLAPI_TRACE_OUTPUT("task:%d proxy %s -> %s \n",
             syscall(__NR_gettid), item[0].name,
             item[1].name);
 
+    int direction = -1;
     while(1){
         int i   = 0;
         ret = -1;
@@ -314,7 +316,14 @@ int SockAPI_Proxy(struct ProxyItem item[2])
                     }
                     else{
                         buf[size ] = 0;
-                        SSLAPI_TRACE_OUTPUT("%s <<<%d:[%s]\n",input->name,size,buf);
+                        if( i != direction ){
+                            SSLAPI_TRACE_OUTPUT_NOTITLE("]\n");
+                            SSLAPI_TRACE_OUTPUT("%s <<<%d:[%s",input->name,size,buf);
+                            direction   = i;
+                        }
+                        else{
+                            SSLAPI_TRACE_OUTPUT_NOTITLE("%s",buf);
+                        }
                         if( input->echostat == PROXYITEM_ECHOSTAT_SHOWONE ){
                             input->echostat  = PROXYITEM_ECHOSTAT_NONE;
                             output->echostat = PROXYITEM_ECHOSTAT_SHOWONE;
@@ -333,6 +342,9 @@ int SockAPI_Proxy(struct ProxyItem item[2])
             break;
         }
     }
+    SSLAPI_TRACE_OUTPUT("\e[43m\e[34m FINISH  :%d proxy\e[0m %s -> %s \n",
+            syscall(__NR_gettid), item[0].name,
+            item[1].name);
 
     return ret;
 }
@@ -918,9 +930,7 @@ static void* accept_connect(void *p)
     }
     else{
         proxyitems[1].sd = clientsock.sd;
-        SSLAPI_TRACE_OUTPUT("begin proxy %d->%d\n",proxyitems[0].sd,proxyitems[1].sd);
         SockAPI_Proxy(proxyitems);
-        SSLAPI_TRACE_OUTPUT("end proxy %d->%d\n",proxyitems[0].sd,proxyitems[1].sd);
     }
 
     SSLAPI_Close(&clientsock);

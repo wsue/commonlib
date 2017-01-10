@@ -4,6 +4,7 @@
 #include <netinet/in.h>
 #include <errno.h>
 
+
 #define WRAP_SYSAPI(ret,func)           do{ \
     ret = func;                             \
 }while( ret == -1 && ( errno == EINTR))
@@ -14,6 +15,7 @@
 #define SET_POLLIN_FLAG(pollfds,fileid)    { (pollfds).fd	= fileid; (pollfds).events = POLLIN_FLAG; }
 #define IS_POLLIN_OK(revent)  (((revent) & POLLIN) && (!((revent) & (POLLERR|POLLHUP|POLLNVAL))) )
 
+#define SSLAPI_DEBUG_OUTPUT(fmt,arg...) printf( "[%s:%d] "fmt,__func__,__LINE__,##arg)
 #define SSLAPI_TRACE_OUTPUT(fmt,arg...) printf( "[%s:%d] "fmt,__func__,__LINE__,##arg)
 
 #define SSLAPI_ERRORCODE_SUCC       0
@@ -32,6 +34,10 @@ static inline void SSLAPI_InitSocket(struct SSLSocket* sslsock){
     sslsock->ssl            = NULL;
 }
 
+#define PROXYITEM_ECHOSTAT_NONE     0       // don't echo recv
+#define PROXYITEM_ECHOSTAT_SHOW     1       // echo recv
+#define PROXYITEM_ECHOSTAT_SHOWONE  2       // only show this, then disable
+#define PROXYITEM_ECHOSTAT_DISABLE  3       // disable echo in all side
 struct ProxyItem;
 typedef int (*PROXYITEM_RECV)(struct ProxyItem* item,char* buf, size_t size);
 typedef int (*PROXYITEM_SEND)(struct ProxyItem* item,const char* buf, size_t size);
@@ -40,6 +46,8 @@ struct ProxyItem{
     PROXYITEM_RECV  recvfunc;
     PROXYITEM_SEND  sendfunc;
     void*           priv;
+    int             echostat;
+    char            name[32];
 };
 
 int SocketAPI_TCPGetLocalPort(int sd);
@@ -59,3 +67,4 @@ void SSLAPI_Close(struct SSLSocket* sslsock);
 void SSLAPI_Release();
 
 #endif
+

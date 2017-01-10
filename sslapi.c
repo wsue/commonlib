@@ -6,11 +6,12 @@
 #include <errno.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/ioctl.h>
+#include <sys/syscall.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <netdb.h>
-#include <netinet/tcp.h>
-#include <sys/ioctl.h>
 #include <poll.h>
 #include <pthread.h>
 //#include <linux/tcp.h>
@@ -21,6 +22,7 @@
 #include <openssl/pem.h>
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <openssl/pkcs12.h>
 
 #include <stdio.h>
 #include <unistd.h>
@@ -251,9 +253,31 @@ static int sendall(struct ProxyItem *item,const char* buf,int size)
     return ret;
 }
 
+
+static void get_connect_name(int sd,char *name)
+{
+    struct sockaddr_in addr;
+    socklen_t           len = sizeof(addr);
+
+    memset(&addr,0,sizeof(addr));
+    if( getpeername(sd, (struct sockaddr*) &addr, &len) == 0) {
+        sprintf(name,"%d/%s:%d",sd,inet_ntoa(addr.sin_addr),htons(addr.sin_port));
+    }
+    else{
+        name[0] = 0;
+    }
+}
+
 int SockAPI_Proxy(struct ProxyItem item[2])
 {
     int ret = -1;
+    get_connect_name(item[0].sd,item[0].name);
+    get_connect_name(item[1].sd,item[1].name);
+
+    SSLAPI_TRACE_OUTPUT("task:%d proxy %s -> %s \n",
+            syscall(__NR_gettid), item[0].name,
+            item[1].name);
+
     while(1){
         int i   = 0;
         ret = -1;
@@ -280,8 +304,23 @@ int SockAPI_Proxy(struct ProxyItem item[2])
             else{
                 struct ProxyItem* input = i ==0 ? &item[0] : &item[1];
                 struct ProxyItem* output = i ==1 ? &item[0] : &item[1];
-                char    buf[8192];
-                int     size    = input->recvfunc(input,buf,sizeof(buf));
+                char    buf[8192*4];
+                int     size    = input->recvfunc(input,buf,sizeof(buf)-1);
+
+                if( size > 0 && input->echostat != PROXYITEM_ECHOSTAT_NONE ){
+                    if( input->echostat == PROXYITEM_ECHOSTAT_DISABLE ){
+                        input->echostat = PROXYITEM_ECHOSTAT_NONE;
+                        output->echostat = PROXYITEM_ECHOSTAT_NONE;
+                    }
+                    else{
+                        buf[size ] = 0;
+                        SSLAPI_TRACE_OUTPUT("%s <<<%d:[%s]\n",input->name,size,buf);
+                        if( input->echostat == PROXYITEM_ECHOSTAT_SHOWONE ){
+                            input->echostat  = PROXYITEM_ECHOSTAT_NONE;
+                            output->echostat = PROXYITEM_ECHOSTAT_SHOWONE;
+                        }
+                    }
+                }
 
                 if( size < 1 || sendall(output,buf,size) < 0 ){
                     ret = -1;
@@ -353,6 +392,186 @@ static SSL_CTX *ssl_servctx_init(const char*certpem,const char* keypem)
     return ctx;
 }
 
+static int p12file2ctx(SSL_CTX *ctx,const char* p12file)
+{
+    int         cert_done   = 0;
+    X509        *x509;
+    EVP_PKEY    *pri        = NULL;
+    X509        *cert       = NULL;
+    STACK_OF (X509) * ca    = NULL;
+    const char *key_passwd = NULL; 
+
+    PKCS12 *p12;
+    FILE* f = fopen(p12file, "rb");
+
+    if(!f) {
+        SSLAPI_TRACE_OUTPUT("could not open PKCS12 file '%s'\n", p12file);
+        return -1;
+    }
+
+    p12 = d2i_PKCS12_fp(f, NULL);
+    fclose(f);
+
+    if(!p12) {
+        SSLAPI_TRACE_OUTPUT( "error reading PKCS12 file '%s'\n", p12file);
+        return -1;
+    }
+
+    PKCS12_PBE_add();
+
+    if(!PKCS12_parse(p12, key_passwd, &pri, &x509,
+                &ca)) {
+        SSLAPI_TRACE_OUTPUT("could not parse PKCS12 file, check password,  error %s \n",
+                ERR_error_string(ERR_get_error(), NULL) );
+        PKCS12_free(p12);
+        return -1;
+    }
+
+    PKCS12_free(p12);
+
+
+    if(SSL_CTX_use_certificate(ctx, x509) != 1) {
+        SSLAPI_TRACE_OUTPUT(
+                "could not load PKCS12 client certificate, error %s",
+                ERR_error_string(ERR_get_error(), NULL) );
+        goto fail;
+    }
+
+    if(SSL_CTX_use_PrivateKey(ctx, pri) != 1) {
+        SSLAPI_TRACE_OUTPUT( "unable to use private key from PKCS12 file '%s'",
+                p12file);
+        goto fail;
+    }
+
+    if(!SSL_CTX_check_private_key (ctx)) {
+        SSLAPI_TRACE_OUTPUT( "private key from PKCS12 file '%s' "
+                "does not match certificate in same file", p12file);
+        goto fail;
+    }
+    /* Set Certificate Verification chain */
+    if(ca) {
+        while(sk_X509_num(ca)) {
+            /*
+             * Note that sk_X509_pop() is used below to make sure the cert is
+             * removed from the stack properly before getting passed to
+             * SSL_CTX_add_extra_chain_cert(). Previously we used
+             * sk_X509_value() instead, but then we'd clean it in the subsequent
+             * sk_X509_pop_free() call.
+             */
+            X509 *x = sk_X509_pop(ca);
+            if(!SSL_CTX_add_extra_chain_cert(ctx, x)) {
+                X509_free(x);
+                SSLAPI_TRACE_OUTPUT( "cannot add certificate to certificate chain");
+                goto fail;
+            }
+            /* SSL_CTX_add_client_CA() seems to work with either sk_* function,
+             * presumably because it duplicates what we pass to it.
+             */
+            if(!SSL_CTX_add_client_CA(ctx, x)) {
+                SSLAPI_TRACE_OUTPUT( "cannot add certificate to client CA list");
+                goto fail;
+            }
+        }
+    }
+
+    cert_done = 1;
+fail:
+    EVP_PKEY_free(pri);
+    X509_free(x509);
+    sk_X509_pop_free(ca, X509_free);
+
+    return cert_done ? 0 : -1;
+}
+
+static DH* get_dh512()
+{
+    static unsigned char dh512_p[]={
+        0xDA,0x58,0x3C,0x16,0xD9,0x85,0x22,0x89,0xD0,0xE4,0xAF,0x75,
+        0x6F,0x4C,0xCA,0x92,0xDD,0x4B,0xE5,0x33,0xB8,0x04,0xFB,0x0F,
+        0xED,0x94,0xEF,0x9C,0x8A,0x44,0x03,0xED,0x57,0x46,0x50,0xD3,
+        0x69,0x99,0xDB,0x29,0xD7,0x76,0x27,0x6B,0xA2,0xD3,0xD4,0x12,
+        0xE2,0x18,0xF4,0xDD,0x1E,0x08,0x4C,0xF6,0xD8,0x00,0x3E,0x7C,
+        0x47,0x74,0xE8,0x33,
+    };
+    static unsigned char dh512_g[]={0x02,};
+    DH *dh=DH_new();
+    dh->p=BN_bin2bn(dh512_p,sizeof(dh512_p),NULL);
+    dh->g=BN_bin2bn(dh512_g,sizeof(dh512_g),NULL);
+    return dh;
+}
+
+static SSL_CTX *ssl_servctx_init_p12(const char*p12file)
+{
+    const char* ciphers = "MEDIUM:HIGH:!RC4:!DSS:!aNULL@STRENGTH";
+
+    int stat = 0;
+    SSL_CTX *ctx;
+    ctx = SSL_CTX_new(SSLv23_server_method());
+
+    if (ctx == NULL) {
+        SSLAPI_TRACE_OUTPUT( "call to SSL_CTX_new() returned NULL\n");
+        return NULL;
+    }
+
+    // Tell SSL that we don't want to request client certificates for
+    // verification
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+
+    if( p12file2ctx(ctx,p12file) != 0 ){
+        SSLAPI_TRACE_OUTPUT( "call to SSL_CTX_new() returned NULL\n");
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
+#if 0
+    // Load the ciphers that they've asked for.
+    // It could be inferred from the documentation for ciphers(1) that you 
+    // can call SSL_CTX_set_cipher_list multiple times to build up a list 
+    // of ciphers.  But that isn't how it works; rather you build up a list 
+    // of ciphers in a string, and then pass that in a single call:
+
+    // First of all disable any ciphers we've got by default
+    ciphers[0] = 0;
+    strcat(ciphers,"-ALL");
+
+    // If they want cipher suites that require certificates, add them in
+    if (enableCertSuites) {
+        strcat(ciphers,":ALL:-aNULL");
+    }
+
+    // If they want the null ones, add them in
+    if (enableNullSuites) {
+        strcat(ciphers,":NULL");
+    }
+
+    // If they want the anonymous ones, add them in
+    if (enableAnonSuites) {
+        strcat(ciphers,":aNULL");
+    }
+#endif
+
+    SSLAPI_DEBUG_OUTPUT("Calling SSL_CTX_set_cipher_list(\"%s\")...\n",ciphers);
+
+
+    stat = SSL_CTX_set_cipher_list(ctx,ciphers);
+    if (stat == 0) {
+        SSLAPI_DEBUG_OUTPUT("SSL_CTX_set_cipher_list() failed");
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
+
+    // Provide DH key information (if you don't do this, then ciphers that
+    // require DH key exchange won't be used, even if they are in the list of
+    // ciphers for the ctx)
+    SSLAPI_DEBUG_OUTPUT("Calling SSL_CTX_set_tmp_dh()...\n");
+    stat = SSL_CTX_set_tmp_dh(ctx,get_dh512());
+    if (stat == 0) {
+        SSLAPI_DEBUG_OUTPUT("SSL_CTX_set_cipher_list() failed");
+        SSL_CTX_free(ctx);
+        return NULL;
+    }
+    return ctx;
+}
+
 static SSL *ssl_servctx_accept(int sd,SSL_CTX *ctx)
 {
     SSL* ssl = SSL_new(ctx);
@@ -366,13 +585,12 @@ static SSL *ssl_servctx_accept(int sd,SSL_CTX *ctx)
 
     return ssl;
 }
-
+ 
 static SSL_CTX *ssl_clientctx_init()
 {
     const SSL_METHOD *method;
     SSL_CTX *ctx;
 
-#if 1
     /* ---------------------------------------------------------- *
      * initialize SSL library and register algorithms             *
      * ---------------------------------------------------------- */
@@ -380,7 +598,6 @@ static SSL_CTX *ssl_clientctx_init()
         SSLAPI_TRACE_OUTPUT("Could not initialize the OpenSSL library !\n");
         return NULL;
     }
-#endif
 
     /* ---------------------------------------------------------- *
      * Set SSLv2 client hello, also announce SSLv3 and TLSv1      *
@@ -462,6 +679,9 @@ static SSL *ssl_clientctx_connect(int sd,SSL_CTX *ctx)
 #endif
 }
 
+//  @ init server, param:
+//  certpem:    public key file, or p12 file(if keypem = NULL)
+//  keypem:     private key file, or NULL(when certpem set to p12 file)
 int SSLAPI_InitSSLServer(const char*certpem,const char* keypem,int port, const char* localaddr)
 {
     ssl_init();
@@ -478,9 +698,17 @@ int SSLAPI_InitSSLServer(const char*certpem,const char* keypem,int port, const c
         return -1;
     }
 
-    sSSLCtrl.servctx_   = ssl_servctx_init(certpem,keypem);
-    if( sSSLCtrl.servctx_ != NULL ){
-        return 0;
+    if( keypem && keypem[0] ){
+        sSSLCtrl.servctx_   = ssl_servctx_init(certpem,keypem);
+        if( sSSLCtrl.servctx_ != NULL ){
+            return 0;
+        }
+    }
+    else{
+        sSSLCtrl.servctx_   = ssl_servctx_init_p12(certpem);
+        if( sSSLCtrl.servctx_ != NULL ){
+            return 0;
+        }
     }
 
     WRAP_CLOSE_FD(sSSLCtrl.listensd_);
@@ -618,9 +846,13 @@ int SSLAPI_Write(struct SSLSocket* sslsock,const char* data,size_t len,int write
     }
 }
     
-
+#if 1
+#define CERT_PEM        "TmmsDefaultTempCert.p12"   
+#define KEY_PEM         NULL                        
+#else
 #define CERT_PEM        "cert.pem"
 #define KEY_PEM         "key.pem"
+#endif
 #define SERVER_ADDR     "10.64.66.229"
 #define SERVER_PORT     443
 
@@ -649,16 +881,26 @@ static void test_client(const char* svraddr,int port)
     SSLAPI_Close(&sslsock);
 }
 
+
+
+
+
+
+
 int sslitem_recv(struct ProxyItem* item,char* buf, size_t size)
 {
     struct SSLSocket*   sslsock = (struct SSLSocket *)item->priv;
-    return SSLAPI_Read(sslsock,buf,size);
+    int ret = SSLAPI_Read(sslsock,buf,size);
+    //printf(" read  %4d      = %d\n",item->sd,ret);
+    return ret;
 }
 
 int sslitem_send(struct ProxyItem* item,const char* buf, size_t size)
 {
     struct SSLSocket*   sslsock = (struct SSLSocket *)item->priv;
-    return SSLAPI_Write(sslsock,buf,size,1);
+    int ret= SSLAPI_Write(sslsock,buf,size,1);
+    //printf(" write %d %4d  = %d\n",item->sd,size,ret);
+    return ret;
 }
 
 static void* accept_connect(void *p)
@@ -666,8 +908,8 @@ static void* accept_connect(void *p)
     struct SSLSocket* svrsock   = (struct SSLSocket *)p;
     struct SSLSocket   clientsock;
     struct ProxyItem proxyitems[2]   = {
-        {svrsock->sd,sslitem_recv,sslitem_send,p},
-        {-1,sslitem_recv,sslitem_send,&clientsock}
+        {svrsock->sd,sslitem_recv,sslitem_send,p, PROXYITEM_ECHOSTAT_SHOW},
+        {-1,sslitem_recv,sslitem_send,&clientsock,PROXYITEM_ECHOSTAT_SHOW}
     };
 
     SSLAPI_InitSocket(&clientsock);

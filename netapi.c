@@ -31,7 +31,11 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 
-#include "sslapi.h"
+#include "netapi.h"
+#ifdef __cplusplus__
+extern "C"{
+#endif
+
 
 struct SSLAPICtl{
     int         isinit_;
@@ -126,7 +130,7 @@ static int CreateTCP(struct addrinfo *pinfo,
 }
 
 
-int SocketAPI_TCPAccept(int ld,struct sockaddr_storage* dst)
+int SockAPI_TCPAccept(int ld,struct sockaddr_storage* dst)
 {
     if( ld == -1 )
         return -1;
@@ -159,7 +163,7 @@ int SocketAPI_TCPAccept(int ld,struct sockaddr_storage* dst)
 
 
 
-int SocketAPI_TCPGetLocalPort(int sd)
+int SockAPI_TCPGetLocalPort(int sd)
 {
     struct sockaddr_in addr;
     socklen_t           len = sizeof(addr);
@@ -172,7 +176,7 @@ int SocketAPI_TCPGetLocalPort(int sd)
     return htons(addr.sin_port);    
 }
 
-int SocketAPI_TCPCreate(const char *serv,uint16_t port,int isbind,int connecttimeout_ms)
+int SockAPI_TCPCreate(const char *serv,uint16_t port,int isbind,int connecttimeout_ms)
 {
     int 	sockfd	= -1;
     char	portstr[32];
@@ -235,6 +239,28 @@ int SocketAPI_TCPCreate(const char *serv,uint16_t port,int isbind,int connecttim
     SSLAPI_TRACE_OUTPUT( "SockAPI_Create fatal create fail for %s:%d bind:%d\n",serv ? serv: "NULL",port,isbind);
     return -1;
 }
+
+int SockAPI_TCPGetInfo(int sd,struct tcp_info* tcpinfo)
+{
+    socklen_t len   = sizeof(*tcpinfo);
+    int ret         = getsockopt(sd,SOL_TCP,TCP_INFO,tcpinfo,&len);
+    return ret;
+}
+
+int SockAPI_TCPSetKeepAlive(int sd,int interval,int cnt)
+{
+    int keepAlive       = 1; // 开启keepalive属性
+    int keepIdle        = interval; // 如该连接在5秒内没有任何数据往来,则进行探测 
+    int keepInterval    = interval; // 探测时发包的时间间隔为5 秒
+    int keepCount       = 3; // 探测尝试的次数.如果第1次探测包就收到响应了,则后2次的不再发.
+
+    int ret1 = setsockopt(sd, SOL_SOCKET, SO_KEEPALIVE, (void *)&keepAlive, sizeof(keepAlive));
+    int ret2 = setsockopt(sd, SOL_TCP, TCP_KEEPIDLE, (void*)&keepIdle, sizeof(keepIdle));
+    int ret3 = setsockopt(sd, SOL_TCP, TCP_KEEPINTVL, (void *)&keepInterval, sizeof(keepInterval));
+    int ret4 = setsockopt(sd, SOL_TCP, TCP_KEEPCNT, (void *)&keepCount, sizeof(keepCount));
+    return 0;
+}
+
 
 static int sendall(struct ProxyItem *item,const char* buf,int size)
 {
@@ -349,6 +375,73 @@ int SockAPI_Proxy(struct ProxyItem item[2])
     return ret;
 }
 
+
+
+
+
+static void SSL_pthreads_locking_callback(int mode, int type, char *file, int line);
+static unsigned long SSL_pthreads_thread_id(void);
+
+static pthread_mutex_t *lock_cs;
+static long *lock_count;
+
+
+static void SSL_thread_setup(void) {
+    int i;
+
+    lock_cs=(pthread_mutex_t*)OPENSSL_malloc(CRYPTO_num_locks() * sizeof(pthread_mutex_t));
+    lock_count=(long *)OPENSSL_malloc(CRYPTO_num_locks() * sizeof(long));
+    for (i=0; i<CRYPTO_num_locks(); i++) {
+        lock_count[i]=0;
+        pthread_mutex_init(&(lock_cs[i]),NULL);
+    }
+
+    CRYPTO_set_id_callback((unsigned long (*)())SSL_pthreads_thread_id);
+    CRYPTO_set_locking_callback((void (*)())SSL_pthreads_locking_callback);
+}
+
+static void SSL_thread_cleanup(void) {
+    int i;
+
+    CRYPTO_set_locking_callback(NULL);
+    fprintf(stderr,"cleanup\n");
+    for (i=0; i<CRYPTO_num_locks(); i++) {
+        pthread_mutex_destroy(&(lock_cs[i]));
+        fprintf(stderr,"%8ld:%s\n",lock_count[i], CRYPTO_get_lock_name(i));
+    }
+    OPENSSL_free(lock_cs);
+    OPENSSL_free(lock_count);
+
+    fprintf(stderr,"done cleanup\n");
+}
+
+static void SSL_pthreads_locking_callback(int mode, int type, char *file, int line) {
+#ifdef undef
+    fprintf(stderr,"thread=%4d mode=%s lock=%s %s:%d\n",
+            CRYPTO_thread_id(),
+            (mode&CRYPTO_LOCK)?"l":"u",
+            (type&CRYPTO_READ)?"r":"w",file,line);
+#endif
+    /*
+       if (CRYPTO_LOCK_SSL_CERT == type)
+       fprintf(stderr,"(t,m,f,l) %ld %d %s %d\n",
+       CRYPTO_thread_id(),
+       mode,file,line);
+       */
+    if (mode & CRYPTO_LOCK) {
+        pthread_mutex_lock(&(lock_cs[type]));
+        lock_count[type]++;
+    } else {
+        pthread_mutex_unlock(&(lock_cs[type]));
+    }
+}
+
+static unsigned long SSL_pthreads_thread_id(void) {
+    unsigned long ret;
+    ret=(unsigned long)pthread_self();
+    return(ret);
+}
+
 static void ssl_init()
 { 
     if( sSSLCtrl.isinit_ )
@@ -360,6 +453,7 @@ static void ssl_init()
     ERR_load_BIO_strings();
     ERR_load_crypto_strings();
     SSL_load_error_strings();
+    SSL_thread_setup();
 }
 
 static void ssl_cleanup()
@@ -367,6 +461,7 @@ static void ssl_cleanup()
     if( sSSLCtrl.isinit_ > 0 ){
         ERR_free_strings();
         EVP_cleanup();
+        SSL_thread_cleanup();
     }
 
     sSSLCtrl.isinit_   = 0;
@@ -720,7 +815,7 @@ int SSLAPI_InitSSLServer(const char*certpem,const char* keypem,int port, const c
         sSSLCtrl.servctx_   = NULL;
     }
 
-    sSSLCtrl.listensd_ = SocketAPI_TCPCreate(localaddr,port,1,-1);
+    sSSLCtrl.listensd_ = SockAPI_TCPCreate(localaddr,port,1,-1);
     if( sSSLCtrl.listensd_ < 0 ){
         SSLAPI_TRACE_OUTPUT("bind to port:%d/%s fail\n",port,localaddr ? localaddr : "0.0.0.0");
         return -1;
@@ -787,7 +882,7 @@ int SSLAPI_Accept(struct SSLSocket* sslsock,struct sockaddr_storage* dst)
 {
     SSLAPI_InitSocket(sslsock);
 
-    int sd  = SocketAPI_TCPAccept(sSSLCtrl.listensd_,dst);
+    int sd  = SockAPI_TCPAccept(sSSLCtrl.listensd_,dst);
     if( sd < 0 ){
         SSLAPI_TRACE_OUTPUT("accept fail\n");
         return -2;
@@ -810,7 +905,7 @@ int SSLAPI_Connect(struct SSLSocket* sslsock, const char* svraddr,int port)
 {
     SSLAPI_InitSocket(sslsock);
 
-    int sd  = SocketAPI_TCPCreate(svraddr,port,0,SSLAPI_CONNECT_TIMEOUT);
+    int sd  = SockAPI_TCPCreate(svraddr,port,0,SSLAPI_CONNECT_TIMEOUT);
     if( sd < 0 ){
         SSLAPI_TRACE_OUTPUT("connect to %s:%d fail\n",svraddr ? svraddr : "NULL",port);
         return -1;
@@ -893,6 +988,7 @@ static void test_client(const char* svraddr,int port)
 {
     char    buf[4096]   = "";
     int     ret;
+    struct tcp_info tcpinfo;
 
     struct SSLSocket   sslsock;
     SSLAPI_InitSocket(&sslsock);
@@ -908,6 +1004,7 @@ static void test_client(const char* svraddr,int port)
     }
 
     printf("connect to %s:%d succ\n",svraddr,port);
+    ret = SockAPI_TCPGetInfo(sslsock.sd, &tcpinfo);
     ret = SSLAPI_Read(&sslsock,buf,sizeof(buf));
     printf("recv %d:%s\n",ret,buf);
 
@@ -1012,7 +1109,8 @@ int SSLAPI_Proxy(int localport, const char* localaddr,
     return 0;
 }
 
-
+#if 1
+// test
 int main(int argc, char** argv)
 {
 #if 0
@@ -1022,11 +1120,18 @@ int main(int argc, char** argv)
                 argv[0],argv[0]);
         return 1;
     }
+    test_client("10.64.66.229",443);
 #endif
 
-    //test_client("10.64.66.229",443);
-    SSLAPI_Proxy(443,NULL,"10.64.66.229",443,  "default.p12",   NULL);
+    SSLAPI_Proxy(443,NULL,"10.64.66.229",443,  "TmmsDefaultTempCert.p12",   NULL);
     //SSLAPI_Proxy(443,NULL,"10.64.66.229",443,  "cert.pem",   "key.pem");
     SSLAPI_Release();
     return 0;
 }
+#endif
+
+#ifdef __cplusplus__
+};
+#endif
+
+

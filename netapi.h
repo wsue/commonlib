@@ -2,8 +2,12 @@
 #define SSL_API_H_
 
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <errno.h>
 
+#ifdef __cplusplus__
+extern "C"{
+#endif
 
 #define WRAP_SYSAPI(ret,func)           do{ \
     ret = func;                             \
@@ -51,9 +55,12 @@ struct ProxyItem{
     char            name[32];
 };
 
-int SocketAPI_TCPGetLocalPort(int sd);
-int SocketAPI_TCPCreate(const char *serv,uint16_t port,int isbind,int connecttimeout_ms);
-int SocketAPI_TCPAccept(int ld,struct sockaddr_storage* dst);
+int SockAPI_TCPGetLocalPort(int sd);
+int SockAPI_TCPCreate(const char *serv,uint16_t port,int isbind,int connecttimeout_ms);
+int SockAPI_TCPAccept(int ld,struct sockaddr_storage* dst);
+int SockAPI_TCPGetInfo(int sd,struct tcp_info* tcpinfo);
+int SockAPI_TCPSetKeepAlive(int sd,int interval_ms,int );
+
 int SockAPI_Proxy(struct ProxyItem *item);
 
 int SSLAPI_InitSSLServer(const char*certpem,const char* keypem,int port, const char* localaddr);
@@ -70,6 +77,10 @@ void SSLAPI_Release();
 int SSLAPI_Proxy(int localport, const char* localaddr,
         const char* dstsvr, int dstport,
         const char* certfile,const char* keyfile);
+
+#ifdef __cplusplus__
+};
+#endif
 
 #endif
 

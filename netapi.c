@@ -26,6 +26,7 @@
 #include <openssl/pem.h>
 #include <openssl/err.h>
 #include <openssl/pkcs12.h>
+#include <openssl/dh.h>
 
 #include <stdio.h>
 #include <unistd.h>
@@ -729,7 +730,6 @@ int SockAPI_SendHttpFileResp(int sd,const char* fname,const char* content_type, 
 
 
 
-
 static int sendall(struct ProxyItem *item,const char* buf,int size)
 {
     int ret = 0;
@@ -1128,6 +1128,9 @@ fail:
  */
 DH *get_dh512()
 {
+#if 1
+    return DH_get_1024_160();
+#else
     static unsigned char dh512_p[]={
 	0x9B,0x9A,0x2B,0x34,0xDA,0x9A,0x55,0x53,0x47,0xDB,0xCF,0xB4,
 	0x26,0xAA,0x4D,0xFD,0x01,0x91,0x4A,0x19,0xE0,0x90,0xFA,0x6B,
@@ -1153,6 +1156,7 @@ DH *get_dh512()
     { DH_free(dh); return(NULL); }
     dh->length = 160;
     return(dh);
+#endif
 }
 
 static SSL_CTX *ssl_servctx_init_p12(const char*p12file)
@@ -1631,7 +1635,11 @@ int SSLAPI_Write(struct SSLSocket* sslsock,const char* data,size_t len,int write
 
 
 
-
+/*-----------------------------------------------------------------------------------------------------------------------------
+ *
+ *                  WRAP API
+ *
+ *----------------------------------------------------------------------------------------------------------------------------*/
 
 struct SSLProxyInfo{
     char    dstsvr[32];
@@ -1764,6 +1772,122 @@ int SSLAPI_Proxy(int localport, const char* localaddr,
 
     return 0;
 }
+
+
+
+
+
+
+
+
+
+#define RECVHEAD_INTERVAL_MS            2000
+static HTTPD_CALLBACK   shttpdcallback  = NULL;
+static int              shttpdld        = -1;
+static void* httpparse_task(void* p)
+{
+    char    buf[8192];
+    size_t  cache_len   = 0;
+
+    long val = (long)p;
+    int sd  = (int) val;
+    if( shttpdcallback(sd,HTTPD_STAT_INIT, NULL) != 0 ){
+        close(sd);
+        SSLAPI_DEBUG_OUTPUT("init parse %d error\n",sd);
+        return NULL;
+    }
+
+    while( shttpdcallback ){
+        struct HttpReqInfo  reqinfo;
+        int callbackret;
+        int ret = SockAPI_Poll(sd,-1);
+
+        if( ret == -1 )
+            break;
+
+        ret = SockAPI_RecvHttpReq(sd,&reqinfo,buf,sizeof(buf),&cache_len,RECVHEAD_INTERVAL_MS);
+        if( ret < 0 )
+            break;
+
+        SSLAPI_DEBUG_OUTPUT("recv %s %s %s %d:%s\n",
+                reqinfo.cmd,reqinfo.uri,reqinfo.head_begin,reqinfo.content_len,reqinfo.content ? reqinfo.content : "");
+        callbackret = shttpdcallback(sd,HTTPD_STAT_EXEC,&reqinfo);
+        if( callbackret < 0 )
+            break;
+        if( callbackret > 0 ){
+            if( SockAPI_SendHttpResp(sd,callbackret,NULL,NULL,NULL,NULL,0) != 0 )
+                break;
+        }
+        memmove(buf,buf+ret,cache_len);
+
+        if( cache_len > 0 ){
+            memmove(buf,buf+ret,cache_len);
+        }
+    }
+
+    shttpdcallback(sd,HTTPD_STAT_RELEASE, NULL);
+    SSLAPI_DEBUG_OUTPUT("exit parse %d\n",sd);
+    close(sd);
+    return NULL;
+}
+
+static void* httpdtask(void * p )
+{
+    while( shttpdld >= 0 ){
+        struct sockaddr_storage peeraddr;
+        struct sockaddr_in      *pin = (struct sockaddr_in *)&peeraddr;
+
+        int sd  = SockAPI_TCPAccept(shttpdld,&peeraddr);
+        long val = sd;
+        if( sd < 0 ){
+            SSLAPI_DEBUG_OUTPUT("accept fail: %d, will stop\n",errno);
+            break;
+        }
+
+        SSLAPI_DEBUG_OUTPUT("accept : %d from:%s:%d\n",
+                sd,inet_ntoa(pin->sin_addr),
+                htons(pin->sin_port));
+        if( Task_Start(NULL,httpparse_task,(void *)val) == 0){
+        }
+        else{
+            SSLAPI_DEBUG_OUTPUT("accept %d create task fail\n",sd);
+            close(sd);
+        }
+    }
+
+    close(shttpdld);
+    shttpdld    = -1;
+    return NULL;
+}
+
+int SockAPI_Httpd(const char* localaddr,uint16_t port,HTTPD_CALLBACK callback,int detached)
+{
+    if( shttpdld > 0 ){
+        close(shttpdld);
+        shttpdld    = -1;
+    }
+
+    if( !callback || port == 0 )
+        return 0;
+
+    shttpdld = SockAPI_TCPCreate(localaddr,port,1,-1);
+    if( shttpdld < 0 ){
+        SSLAPI_TRACE_OUTPUT("bind to %d fail\n",port);
+        return -1;
+    }
+
+    shttpdcallback      = callback;
+    SSLAPI_DEBUG_OUTPUT("bind to %d succ\n",port);
+    long val    = shttpdld;
+    if( detached ){
+        Task_Start(NULL,httpdtask,NULL);
+    }
+    else{
+        httpdtask(NULL);
+    }
+    return 0;
+}
+
 
 #ifdef __cplusplus__
 };

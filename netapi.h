@@ -100,10 +100,23 @@ int SSLAPI_Write(struct SSLSocket* sslsock,const char* data,size_t len,int write
 void SSLAPI_Close(struct SSLSocket* sslsock);
 void SSLAPI_Release();
 
+/*  wrap api    */
 int SSLAPI_Proxy(int localport, const char* localaddr,
         const char* dstsvr, int dstport,
         const char* certfile,const char* keyfile);
 
+#define HTTPD_STAT_INIT         1
+#define HTTPD_STAT_EXEC         2
+#define HTTPD_STAT_RELEASE      3
+/*  return  0:  succ,and has send http resp
+ *          >0: http status code(when httpdstat == HTTPD_STAT_EXEC)
+ *          -1: error, need terminate connection
+ */
+typedef int (*HTTPD_CALLBACK)(int sd,int httpdstat,struct HttpReqInfo *reqinfo);
+
+//  tiny http server, multi thread + callback
+//  if callback == NULL || port == 0 , then stop current tiny http server
+int SockAPI_Httpd(const char* localaddr,uint16_t port,HTTPD_CALLBACK callback,int detached);
 #ifdef __cplusplus__
 };
 #endif

@@ -1,6 +1,7 @@
-#include <sys/types.h>
-#include <dirent.h>
 #include <unistd.h>
+#include <string.h>
+#include <dirent.h>
+#include <sys/types.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -12,13 +13,15 @@
 
 #define URISTR_ACTCMD_DEL   "&act=del"
 
+static char   sRootDir[256];
+static size_t sRootDir_sz;
 
-static int parse_indexreq(int sd)
+static int parse_indexreq(int sd,const char* rootdir)
 {
     char    buf[81920];
     size_t  offset  = 0;
     struct dirent* dent;
-    DIR * dir = opendir(".");
+    DIR * dir = opendir(rootdir);
     if( !dir ){ 
         if( SockAPI_SendHttpResp(sd,500,"get dir list fail",NULL,NULL,NULL,0) != 0 )
             return -1;
@@ -45,10 +48,19 @@ static int parse_indexreq(int sd)
 
 
 
-static int parse_req(int sd,struct HttpReqInfo* reqinfo)
+static int parse_req(int sd,int stat,struct HttpReqInfo* reqinfo)
 {
     char *splash = NULL;
-    char *pact  = strstr(reqinfo->uri,URISTR_ACTCMD_DEL);
+    char *pact  = NULL;
+    char fullname[512];
+    
+    if( stat != HTTPD_STAT_EXEC )
+        return 0;
+
+    if( strcmp(reqinfo->cmd,"GET") || reqinfo->content_len > 0 )
+        return 500;
+
+    pact    = strstr(reqinfo->uri,URISTR_ACTCMD_DEL);
     if( pact ){
         *pact++ = 0;
     }
@@ -57,90 +69,39 @@ static int parse_req(int sd,struct HttpReqInfo* reqinfo)
     if( splash ){
         splash++;
         if( splash[0] == 0 )
-            return parse_indexreq(sd);
+            return parse_indexreq(sd,sRootDir);
     }
     else{
         splash  = reqinfo->uri;
     }
 
-    return SockAPI_SendHttpFileResp(sd,splash,"text/plain", NULL);
+    if( strlen(splash) + sRootDir_sz +1> sizeof(fullname) )
+        return 500;
+
+    sprintf(fullname,"%s%s",sRootDir,splash);
+    return SockAPI_SendHttpFileResp(sd,fullname,"text/plain", NULL);
 }
 
-static void* parse_task(void* p)
+
+static int runhttpd(int port,const char* root)
 {
-    char    buf[8192];
-    size_t  cache_len   = 0;
-
-    int sd  = (int) p;
-    while(1){
-        struct HttpReqInfo  reqinfo;
-        int ret = SockAPI_Poll(sd,-1);
-        if( ret == -1 )
-            break;
-
-        ret = SockAPI_RecvHttpReq(sd,&reqinfo,buf,sizeof(buf),&cache_len,RECVHEAD_INTERVAL_MS);
-        if( ret < 0 )
-            break;
-
-        printf("recv %s %s %s %d:%s\n",
-                reqinfo.cmd,reqinfo.uri,reqinfo.head_begin,reqinfo.content_len,reqinfo.content ? reqinfo.content : "");
-        if( strcmp(reqinfo.cmd,"GET") || reqinfo.content_len > 0 ){
-            if( SockAPI_SendHttpResp(sd,500,"Unsupport Command",NULL,NULL,NULL,0) != 0 )
-                break;
-
-            if( cache_len > 0 ){
-                memmove(buf,buf+ret,cache_len);
-            }
-            continue;
-        }
-
-        if( parse_req(sd,&reqinfo) != 0 ){
-            break;
-        }
-
-
-        memmove(buf,buf+ret,cache_len);
+    char*   p;
+    strcpy(sRootDir,root);
+    sRootDir_sz = strlen(sRootDir);
+    p   = sRootDir + sRootDir_sz;
+    if( p[-1] != '/' ){
+        *p++            = '/';
+        *p++            = 0;
+        sRootDir_sz     ++;
     }
 
-    printf("exit parse %d\n",sd);
-    close(sd);
-    return NULL;
+    SockAPI_Httpd(NULL,LISTEN_PORT,parse_req,0);
+    return 0;
 }
 
 
 int main()
 {
-    int ld = SockAPI_TCPCreate(NULL,LISTEN_PORT,1,-1);
-    if( ld < 0 ){
-        printf("bind to %d fail\n",LISTEN_PORT);
-        return 1;
-    }
-
-    printf("bind to %d succ\n",LISTEN_PORT);
-    while( ld >= 0 ){
-        struct sockaddr_storage peeraddr;
-        struct sockaddr_in      *pin = (struct sockaddr_in *)&peeraddr;
-
-        int sd  = SockAPI_TCPAccept(ld,&peeraddr);
-        long val = sd;
-        if( sd < 0 ){
-            printf("accept fail: %d\n",errno);
-            continue;
-        }
-
-        printf("accept : %d from:%s:%d\n",
-                sd,inet_ntoa(pin->sin_addr),
-                htons(pin->sin_port));
-        if( Task_Start(NULL,parse_task,(void *)val) == 0){
-        }
-        else{
-            printf("accept %d create task fail\n",sd);
-            close(sd);
-        }
-    }
-
-    close(ld);
+    runhttpd(LISTEN_PORT,".");
     return 0;
 }
-
-

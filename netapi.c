@@ -1567,7 +1567,7 @@ int SSLAPI_Connect(struct SSLSocket* sslsock, const char* svraddr,int port)
 {
     SSLAPI_InitSocket(sslsock);
 
-    int sd  = SockAPI_TCPCreate(svraddr,port,0,SSLAPI_CONNECT_TIMEOUT);
+    int sd  = SockAPI_TCPCreate(svraddr,port,0,SSLAPI_CONNECT_TIMEOUT_MS);
     if( sd < 0 ){
         SSLAPI_TRACE_OUTPUT("connect to %s:%d fail\n",svraddr ? svraddr : "NULL",port);
         return -1;

@@ -28,7 +28,7 @@ extern "C"{
 #define SSLAPI_ERRORCODE_INIT       1
 
 #define TCP_DEFAULTBACK_LOG         10
-#define SSLAPI_CONNECT_TIMEOUT      7
+#define SSLAPI_CONNECT_TIMEOUT_MS   200
 
 struct SSL;
 struct SSLSocket{

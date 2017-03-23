@@ -1,0 +1,48 @@
+#!/bin/sh
+
+WAN="eth0"               # gateway’s wan port
+LAN="eth0"               # gateway’s lan port
+SVRIP="10.64.1.11"      # web server’s ipaddress
+
+echo 1 > /proc/sys/net/ipv4/ip_forward
+sysctl -w net.ipv4.ip_forward=1
+
+iptables -F
+iptables -t nat -F
+iptables -t mangle -F
+iptables -X
+
+#
+# Debug logging
+#iptables -I INPUT 1 --source 130.235.35.233/31 -j LOG --log-prefix "INPUT: "
+#iptables -I FORWARD 1 --source 130.235.35.233/31 -j LOG --log-prefix "FOWARD: "
+
+
+#
+# Default to drop packets
+iptables -P INPUT DROP
+iptables -P OUTPUT DROP
+iptables -P FORWARD DROP
+
+#
+# Allow all local loopback traffic
+iptables -A INPUT -i lo -j ACCEPT
+iptables -A OUTPUT -o lo -j ACCEPT
+
+#
+# Allow output on $WAN and $LAN if. Allow input on $LAN if.
+iptables -A INPUT -i $LAN -j ACCEPT
+iptables -A OUTPUT -o $WAN -j ACCEPT
+iptables -A OUTPUT -o $LAN -j ACCEPT
+
+iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+iptables -A FORWARD -o $LAN -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+iptables -A FORWARD -i $LAN -o $WAN -j ACCEPT
+iptables -t nat -A POSTROUTING -o $WAN -j MASQUERADE
+
+# SSH
+iptables -t nat -A PREROUTING -p tcp -i $WAN -m multiport --dports 443 -j DNAT --to $SVRIP
+iptables -A FORWARD -p tcp -i $WAN -o $LAN -d $SVRIP -m multiport --dports 443 -j ACCEPT
+

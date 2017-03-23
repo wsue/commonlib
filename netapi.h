@@ -4,6 +4,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <errno.h>
+#include <openssl/ssl.h>
 
 #ifdef __cplusplus__
 extern "C"{
@@ -55,11 +56,36 @@ struct ProxyItem{
     char            name[32];
 };
 
+struct HttpReqInfo{
+    //  this point to origbuf
+    char* cmd;                // in upper case
+    char* uri;
+    char* head_begin;         //  multi lines, each line end with \r\n
+    char* content;
+    size_t      content_len;        //  total body size
+    size_t      content_readsz;     //  body has readed
+};
+
+int Task_Start(pthread_t *thrid,void* (*start_routine)(void*),void *arg);
+
 int SockAPI_TCPGetLocalPort(int sd);
 int SockAPI_TCPCreate(const char *serv,uint16_t port,int isbind,int connecttimeout_ms);
 int SockAPI_TCPAccept(int ld,struct sockaddr_storage* dst);
 int SockAPI_TCPGetInfo(int sd,struct tcp_info* tcpinfo);
 int SockAPI_TCPSetKeepAlive(int sd,int interval_ms,int );
+
+int SockAPI_Poll(int sd,int timeout_ms);
+int SockAPI_PollEx(int sd,int timeout_ms,int* haserror);
+int SockAPI_Recv(int sd,char* p, size_t size,int timeout_ms);
+int SockAPI_RecvN(int sd,char* p, size_t size,int timeout_ms,uint16_t interval_wait_ms);
+int SockAPI_SendN(int sd,const char* p, size_t size);
+
+
+int SockAPI_RecvHttpReq(int sd,struct HttpReqInfo* head,char* p,size_t size,size_t* cache_size,uint16_t interval_wait_ms);
+int SockAPI_SendHttpFileResp(int sd,const char* fname,const char* content_type, const char* other_head);
+int SockAPI_SendHttpResp(int sd,int status, const char* statusstr,
+        const char* content_type,const char* otherhead,
+        const char* content, size_t content_len);
 
 int SockAPI_Proxy(struct ProxyItem *item);
 
